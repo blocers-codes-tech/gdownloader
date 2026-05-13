@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'Target URLs (Separate with space, comma, or new line)'
+        description: 'Target URLs (space, comma, semicolon, or new line separated; multiple URLs run one-by-one)'
         required: true
         type: string
       youtube_method:
@@ -31,6 +31,7 @@ on:
           - '360p (MP4 format)'
           - 'Audio (MP3 format)'
           - 'Best (Highest available)'
+          - 'Highest quality (MP4 - Fast API first, yt-dlp fallback with cookies if set)'
       password:
         description: 'ZIP Password (Optional - No ZIP applied if empty & under 95MB)'
         required: false
@@ -131,45 +132,72 @@ jobs:
               'Origin': 'https://media.ytmp3.gg'
           }
           
-          if "Audio" in quality_input:
-              payload = {'url': url, 'os': 'linux', 'output': {'type': 'audio', 'format': 'mp3'}, 'audio': {'bitrate': '320k'}}
-              ext = 'mp3'
-          else:
-              q = '720p'
-              if '1080' in quality_input: q = '1080p'
-              elif '480' in quality_input: q = '480p'
-              elif '360' in quality_input: q = '360p'
-              payload = {'url': url, 'os': 'linux', 'output': {'type': 'video', 'format': 'mp4', 'quality': q}}
-              ext = 'mp4'
-          
-          try:
-              resp = requests.post(API, json=payload, headers=HEADERS, timeout=15)
-              if resp.status_code != 200: sys.exit(1)
-              
-              status_url = resp.json().get('statusUrl')
-              if not status_url: sys.exit(1)
-              
+          def poll_until_done(status_url, ext):
               for _ in range(60):
                   time.sleep(2)
                   s_resp = requests.get(status_url, headers=HEADERS, timeout=10)
-                  if s_resp.status_code == 200:
-                      data = s_resp.json()
-                      if data.get('status') == 'completed':
-                          dl_url = data.get('downloadUrl')
-                          raw_title = data.get('title', 'YouTube_Video')
-                          title = re.sub(r'[\\/*?:"<>| ]', '_', raw_title)
-                          
-                          if dl_url:
-                              filepath = os.path.join(outdir, f"{title}.{ext}")
-                              dl_req = requests.get(dl_url, stream=True, timeout=60)
-                              with open(filepath, "wb") as f:
-                                  for chunk in dl_req.iter_content(8192):
-                                      if chunk: f.write(chunk)
-                              sys.exit(0)
-                      elif data.get('status') in ('failed', 'error'):
-                          sys.exit(1)
+                  if s_resp.status_code != 200:
+                      continue
+                  data = s_resp.json()
+                  st = data.get('status')
+                  if st == 'completed':
+                      dl_url = data.get('downloadUrl')
+                      raw_title = data.get('title', 'YouTube_Video')
+                      title = re.sub(r'[\\/*?:"<>| ]', '_', raw_title)
+                      if dl_url:
+                          filepath = os.path.join(outdir, f"{title}.{ext}")
+                          dl_req = requests.get(dl_url, stream=True, timeout=60)
+                          with open(filepath, "wb") as f:
+                              for chunk in dl_req.iter_content(8192):
+                                  if chunk:
+                                      f.write(chunk)
+                          return True
+                  elif st in ('failed', 'error'):
+                      return False
+              return False
+          
+          def try_video_quality(q):
+              payload = {'url': url, 'os': 'linux', 'output': {'type': 'video', 'format': 'mp4', 'quality': q}}
+              try:
+                  resp = requests.post(API, json=payload, headers=HEADERS, timeout=15)
+                  if resp.status_code != 200:
+                      return False
+                  status_url = resp.json().get('statusUrl')
+                  if not status_url:
+                      return False
+                  return poll_until_done(status_url, 'mp4')
+              except Exception:
+                  return False
+          
+          try:
+              if "Audio" in quality_input:
+                  payload = {'url': url, 'os': 'linux', 'output': {'type': 'audio', 'format': 'mp3'}, 'audio': {'bitrate': '320k'}}
+                  resp = requests.post(API, json=payload, headers=HEADERS, timeout=15)
+                  if resp.status_code != 200:
+                      sys.exit(1)
+                  status_url = resp.json().get('statusUrl')
+                  if not status_url:
+                      sys.exit(1)
+                  sys.exit(0 if poll_until_done(status_url, 'mp3') else 1)
+          
+              explicit = None
+              if '1080' in quality_input:
+                  explicit = '1080p'
+              elif '480' in quality_input:
+                  explicit = '480p'
+              elif '360' in quality_input:
+                  explicit = '360p'
+              elif '720' in quality_input:
+                  explicit = '720p'
+          
+              if explicit:
+                  sys.exit(0 if try_video_quality(explicit) else 1)
+          
+              for q in ('2160p', '1440p', '1080p', '720p'):
+                  if try_video_quality(q):
+                      sys.exit(0)
               sys.exit(1)
-          except Exception as e:
+          except Exception:
               sys.exit(1)
           EOF
 
@@ -180,7 +208,7 @@ jobs:
           QUALITY="${{ github.event.inputs.quality }}"
           YT_METHOD="${{ github.event.inputs.youtube_method }}"
           
-          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ',' ' ' | tr '\n' ' ')
+          FORMATTED_URLS=$(echo "$RAW_URLS" | tr ';,\n' '   ')
           
           rm -rf tmp_downloads
           mkdir -p tmp_downloads dl
@@ -191,8 +219,10 @@ jobs:
             YTDLP_F="-f bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]/best --merge-output-format mp4"
           elif [[ "$QUALITY" == *"360p"* ]]; then
             YTDLP_F="-f bestvideo[ext=mp4][height<=360]+bestaudio[ext=m4a]/best[ext=mp4][height<=360]/best --merge-output-format mp4"
+          elif [[ "$QUALITY" == *"Highest quality"* ]] || [[ "$QUALITY" == *"Best"* ]]; then
+            YTDLP_F="-f bestvideo*+bestaudio/best --merge-output-format mp4"
           elif [[ "$QUALITY" == *"Audio"* ]]; then
-            YTDLP_F="-x --audio-format mp3"
+            YTDLP_F="-f bestaudio/ba -x --audio-format mp3 --audio-quality 0"
           else
             YTDLP_F="--merge-output-format mp4"
           fi
